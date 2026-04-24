@@ -18,6 +18,7 @@ import {
   RotateCcw,
   RotateCw,
   Settings,
+  ChevronLeft,
   ChevronRight,
   ChevronDown,
   Share2,
@@ -539,8 +540,11 @@ export default function App() {
   const [isPlayerOpen, setIsPlayerOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [archived, setArchived] = useState(false);
+  const [customText, setCustomText] = useState('');
+  const [customTitle, setCustomTitle] = useState('');
+  const [currentPageIndex, setCurrentPageIndex] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
-  const [activeTab, setActiveTab] = useState<'live' | 'settings' | 'history'>('live');
+  const [activeTab, setActiveTab] = useState<'live' | 'settings' | 'history' | 'visual'>('live');
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
@@ -755,14 +759,28 @@ export default function App() {
   const playNeuralSpeech = async () => {
     if (!transcription) return;
     
+    // Check if we already have an audio object playing
+    if (audioRef.current) {
+      if (isSpeaking) {
+        audioRef.current.pause();
+        setIsSpeaking(false);
+      } else {
+        audioRef.current.play();
+        setIsSpeaking(true);
+      }
+      return;
+    }
+
     // Check if the current last archive item matches this transcription and has a blob
     const existingItem = transcriptionHistory.find(i => i.text === transcription);
     
     if (existingItem?.generatedAudioBlob) {
       const url = URL.createObjectURL(existingItem.generatedAudioBlob);
       const audio = new Audio(url);
+      audioRef.current = audio;
       audio.onended = () => {
         setIsSpeaking(false);
+        audioRef.current = null;
         URL.revokeObjectURL(url);
       };
       setIsSpeaking(true);
@@ -778,8 +796,10 @@ export default function App() {
         const wavBlob = pcmToWavBlob(base64Pcm);
         const url = URL.createObjectURL(wavBlob);
         const audio = new Audio(url);
+        audioRef.current = audio;
         audio.onended = () => {
           setIsSpeaking(false);
+          audioRef.current = null;
           URL.revokeObjectURL(url);
         };
         audio.play();
@@ -794,12 +814,23 @@ export default function App() {
 
   const handlePlaybackToggle = () => {
     if (isSpeaking) {
+      if (audioRef.current) {
+        audioRef.current.pause();
+      } else {
+        window.speechSynthesis.cancel();
+      }
       setIsSpeaking(false);
-      window.speechSynthesis.cancel();
     } else {
       playNeuralSpeech();
     }
   };
+
+  const mainSkip = (seconds: number) => {
+    if (audioRef.current) {
+      audioRef.current.currentTime = Math.max(0, Math.min(audioRef.current.duration, audioRef.current.currentTime + seconds));
+    }
+  };
+
 
   const skipForward = () => {
     const sentences = getSentences(transcription);
@@ -1015,20 +1046,51 @@ export default function App() {
   };
 
   const handleDownloadImage = async () => {
-    if (!visualCardRef.current || !transcription) return;
+    const isVisual = activeTab === 'visual';
+    const hasContent = isVisual ? !!customText.trim() : !!transcription;
+    if (!visualCardRef.current || !hasContent) return;
     
     setIsSharing(true);
     try {
-      await new Promise(r => setTimeout(r, 100));
-      const dataUrl = await toPng(visualCardRef.current, {
-        quality: 1.0,
-        backgroundColor: '#F9F7F2',
-      });
-      
-      const link = document.createElement('a');
-      link.download = `vocalis-${Date.now()}.png`;
-      link.href = dataUrl;
-      link.click();
+      if (isVisual) {
+        // Handle multi-page download
+        const words = customText.split(/\s+/);
+        const wordsPerPage = 350;
+        const totalPages = Math.ceil(words.length / wordsPerPage) || 1;
+        
+        for (let i = 0; i < totalPages; i++) {
+          setCurrentPageIndex(i);
+          // Wait for state to propagate and DOM to update
+          await new Promise(r => setTimeout(r, 100)); 
+          
+          if (!visualCardRef.current) continue;
+
+          const dataUrl = await toPng(visualCardRef.current, {
+            quality: 1.0,
+            backgroundColor: '#F9F7F2',
+            pixelRatio: 2, // Higher quality
+          });
+          
+          const link = document.createElement('a');
+          link.download = `vocalis-${customTitle || 'card'}-page-${i + 1}-of-${totalPages}.png`;
+          link.href = dataUrl;
+          link.click();
+          
+          // Minimal delay between batches
+          await new Promise(r => setTimeout(r, 50));
+        }
+      } else {
+        await new Promise(r => setTimeout(r, 100));
+        const dataUrl = await toPng(visualCardRef.current, {
+          quality: 1.0,
+          backgroundColor: '#F9F7F2',
+        });
+        
+        const link = document.createElement('a');
+        link.download = `vocalis-${Date.now()}.png`;
+        link.href = dataUrl;
+        link.click();
+      }
     } catch (err) {
       console.error('Download failed:', err);
       setError('Failed to generate image for download.');
@@ -1123,7 +1185,7 @@ export default function App() {
                 }
               `}} />
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {transcription}
+                {activeTab === 'visual' ? customText : transcription}
               </ReactMarkdown>
             </div>
           </div>
@@ -1227,14 +1289,215 @@ export default function App() {
         </aside>
 
         {/* Main Recorder/Transcriber Area */}
-        <section className={`flex-1 flex flex-col bg-white/5 md:bg-white/10 relative overflow-y-auto pb-40 ${activeTab !== 'live' ? 'hidden md:flex' : 'flex'}`}>
+        <section className={`flex-1 flex flex-col bg-white/5 md:bg-white/10 relative overflow-y-auto pb-40 ${activeTab === 'live' || activeTab === 'visual' ? 'flex' : 'hidden'}`}>
           <motion.div 
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             className="flex-1 flex flex-col justify-start px-6 py-4 md:p-12 md:pt-8 max-w-4xl mx-auto w-full"
           >
+            {activeTab === 'visual' && (
+              <motion.div 
+                key="visual-tab"
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="space-y-8"
+              >
+                <div className="flex flex-col gap-2">
+                  <h2 className="text-3xl font-serif italic tracking-tight">Text to Visual Card</h2>
+                  <p className="text-[11px] uppercase font-black text-black/30 tracking-widest">Format and export text as polished cards</p>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
+                  <div className="space-y-6">
+                    <div className="bg-white/40 backdrop-blur-xl border border-black/5 rounded-3xl p-6 shadow-xl shadow-black/5 space-y-4">
+                      <div>
+                        <label className="text-[10px] uppercase font-black text-black/30 tracking-widest block mb-2">Card Title</label>
+                        <input 
+                          type="text"
+                          value={customTitle}
+                          onChange={(e) => setCustomTitle(e.target.value)}
+                          placeholder="Enter a title for your cards..."
+                          className="w-full bg-black/[0.02] border border-black/[0.05] rounded-xl px-4 py-3 text-sm font-bold focus:outline-none focus:ring-1 focus:ring-black/10"
+                        />
+                      </div>
+                      
+                      <div>
+                        <label className="text-[10px] uppercase font-black text-black/30 tracking-widest block mb-2">Input Content</label>
+                        <textarea 
+                          value={customText}
+                          onChange={(e) => {
+                            setCustomText(e.target.value);
+                            setCurrentPageIndex(0);
+                          }}
+                          placeholder="Paste your text here..."
+                          className="w-full h-80 bg-black/[0.02] border border-black/[0.05] rounded-2xl p-6 text-sm font-medium focus:outline-none focus:ring-1 focus:ring-black/10 resize-none custom-scrollbar"
+                        />
+                        <div className="flex justify-between items-center mt-4">
+                          <div className="flex gap-4">
+                            <span className="text-[9px] font-black text-black/20 uppercase tracking-widest">{customText.split(/\s+/).filter(Boolean).length} Words</span>
+                            <span className="text-[9px] font-black text-black/20 uppercase tracking-widest">{Math.ceil(customText.split(/\s+/).filter(Boolean).length / 350) || 1} Pages</span>
+                          </div>
+                          <button 
+                            onClick={() => {
+                              setCustomText('');
+                              setCurrentPageIndex(0);
+                            }}
+                            className="text-[9px] font-black text-red-500/60 hover:text-red-500 uppercase tracking-widest transition-colors"
+                          >
+                            Clear
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <motion.button 
+                        whileHover={{ scale: 1.01 }}
+                        whileTap={{ scale: 0.98 }}
+                        onClick={handleDownloadImage}
+                        disabled={!customText.trim() || isSharing}
+                        className="flex-1 px-4 py-5 bg-black text-white text-[11px] uppercase font-black tracking-widest flex items-center justify-center gap-2 rounded-xl shadow-xl shadow-black/10 disabled:opacity-30"
+                      >
+                        {isSharing ? <RefreshCcw size={18} className="animate-spin" /> : <Download size={18} />}
+                        {isSharing ? 'Generating...' : 'Download All Cards'}
+                      </motion.button>
+                      
+                      <motion.button 
+                        whileHover={{ scale: 1.01 }}
+                        whileTap={{ scale: 0.98 }}
+                        onClick={async () => {
+                           if (!customText.trim()) return;
+                           setIsGeneratingAudio(true);
+                           try {
+                             const base64Pcm = await textToSpeech(customText, options.ttsVoice || 'Kore');
+                             if (base64Pcm) {
+                               const wavBlob = pcmToWavBlob(base64Pcm);
+                               const url = URL.createObjectURL(wavBlob);
+                               const link = document.createElement('a');
+                               link.href = url;
+                               link.download = `vocalis-speech-${Date.now()}.wav`;
+                               link.click();
+                               URL.revokeObjectURL(url);
+                             }
+                           } catch (err) {
+                             console.error(err);
+                           } finally {
+                             setIsGeneratingAudio(false);
+                           }
+                        }}
+                        disabled={!customText.trim() || isGeneratingAudio}
+                        className="flex-1 px-4 py-5 border border-black text-black text-[11px] uppercase font-black tracking-widest flex items-center justify-center gap-2 rounded-xl hover:bg-black/5 disabled:opacity-30"
+                      >
+                         {isGeneratingAudio ? <RefreshCcw size={18} className="animate-spin" /> : <Volume2 size={18} />}
+                         TTS Generation
+                      </motion.button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-6">
+                    <div className="flex items-center justify-between px-2">
+                       <label className="text-[10px] uppercase font-black text-black/30 tracking-widest block">Live Preview</label>
+                       {customText.trim() && (
+                         <div className="flex items-center gap-4">
+                            <button 
+                              onClick={() => setCurrentPageIndex(p => Math.max(0, p - 1))}
+                              disabled={currentPageIndex === 0}
+                              className="text-black/30 hover:text-black disabled:opacity-10 transition-colors"
+                            >
+                              <ChevronLeft size={16} />
+                            </button>
+                            <span className="text-[10px] font-black uppercase tracking-widest text-black/40">
+                              {currentPageIndex + 1} / {Math.ceil(customText.split(/\s+/).filter(Boolean).length / 350) || 1}
+                            </span>
+                            <button 
+                              onClick={() => setCurrentPageIndex(p => Math.min(Math.ceil(customText.split(/\s+/).filter(Boolean).length / 350) - 1, p + 1))}
+                              disabled={currentPageIndex >= (Math.ceil(customText.split(/\s+/).filter(Boolean).length / 350) - 1)}
+                              className="text-black/30 hover:text-black disabled:opacity-10 transition-colors"
+                            >
+                              <ChevronRight size={16} />
+                            </button>
+                         </div>
+                       )}
+                    </div>
+
+                    <div className="relative group">
+                      <div className="absolute -inset-4 bg-gradient-to-tr from-black/5 to-transparent rounded-[3rem] blur-2xl opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
+                      <div 
+                        ref={visualCardRef}
+                        className="bg-[#F9F7F2] border border-black shadow-2xl rounded-sm p-10 min-h-[500px] relative overflow-hidden flex flex-col"
+                      >
+                        <div className="flex justify-between items-start mb-8">
+                          <VocalisLogo className="w-8 h-8 text-black" />
+                          <div className="flex flex-col items-end">
+                            <div className="text-[8px] uppercase font-black tracking-[0.4em] text-black/20 italic">Visual Render v1</div>
+                            <div className="text-[7px] uppercase font-black tracking-widest text-black/10 mt-1">
+                              Page {currentPageIndex + 1} of {Math.ceil(customText.split(/\s+/).filter(Boolean).length / 350) || 1}
+                            </div>
+                          </div>
+                        </div>
+
+                        {customTitle && (
+                          <h3 className="text-xl font-serif italic mb-6 border-b border-black/5 pb-4 opacity-80">{customTitle}</h3>
+                        )}
+
+                        <div 
+                          className={`flex-1 ${options.fontFamily === 'sans' ? 'font-sans' : options.fontFamily === 'mono' ? 'font-mono' : 'font-serif'} whitespace-pre-wrap break-words italic leading-relaxed text-justify`}
+                          style={{ fontSize: `${options.fontSize}px` }}
+                        >
+                          {customText ? customText.split(/\s+/).slice(currentPageIndex * 350, (currentPageIndex + 1) * 350).join(' ') : 'Your content will appear here...'}
+                        </div>
+
+                        <div className="mt-12 pt-8 border-t border-black/10 flex justify-between items-end opacity-40">
+                           <div className="text-[9px] font-serif italic">{new Date().toLocaleDateString()}</div>
+                           <div className="text-[8px] uppercase font-black tracking-widest">Shared via Vocalis</div>
+                        </div>
+                        
+                        <div 
+                          className="absolute inset-0 pointer-events-none opacity-[0.02] mix-blend-multiply"
+                          style={{ backgroundImage: 'url("https://www.transparenttextures.com/patterns/felt.png")' }}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="bg-black/[0.02] border border-black/5 rounded-3xl p-6 space-y-6">
+                       <div className="flex items-center justify-between">
+                         <span className="text-[10px] uppercase font-black text-black/40 tracking-widest">Text Style</span>
+                         <div className="flex bg-black/[0.03] p-0.5 rounded-lg border border-black/[0.05]">
+                          {['serif', 'sans', 'mono'].map((f) => (
+                            <button
+                              key={f}
+                              onClick={() => setOptions({...options, fontFamily: f as any})}
+                              className={`px-3 py-1 text-[8px] uppercase font-black tracking-widest rounded-md transition-all ${options.fontFamily === f ? 'bg-white text-black shadow-sm' : 'text-black/30 hover:text-black/50'}`}
+                            >
+                              {f}
+                            </button>
+                          ))}
+                        </div>
+                       </div>
+
+                       <div className="space-y-2">
+                         <div className="flex justify-between items-center text-[10px] font-black text-black/40 uppercase tracking-widest">
+                           <span>Scale</span>
+                           <span>{options.fontSize}px</span>
+                         </div>
+                         <input 
+                            type="range" 
+                            min="12" 
+                            max="32" 
+                            value={options.fontSize} 
+                            onChange={(e) => setOptions({...options, fontSize: parseInt(e.target.value)})}
+                            className="custom-range w-full"
+                          />
+                       </div>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
             <AnimatePresence mode="wait">
-              {transcription ? (
+              {activeTab === 'live' && (
+                transcription ? (
                 <motion.div 
                   key="output"
                   initial={{ opacity: 0, scale: 0.95 }}
@@ -1461,34 +1724,52 @@ export default function App() {
                         </div>
 
                         {/* Transport Controls */}
-                        <div className="flex items-center justify-center gap-12 pb-1">
+                        <div className="flex items-center justify-center gap-4 sm:gap-8 pb-1">
                           <button 
-                            onClick={skipBackward}
-                            disabled={currentSentenceIndex <= 0}
-                            className="text-black/40 hover:text-black transition-all disabled:opacity-10 hover:scale-110 active:scale-90"
+                            onClick={() => mainSkip(-15)}
+                            className="text-black/15 hover:text-black transition-all hover:scale-110 active:scale-95 shrink-0"
+                            title="Skip back 15s"
                           >
-                            <SkipBack size={24} fill="currentColor" />
+                            <RotateCcw size={18} />
                           </button>
-                          
-                          <motion.button 
-                            whileHover={{ scale: 1.1 }}
-                            whileTap={{ scale: 0.9 }}
-                            animate={isSpeaking ? { 
-                              boxShadow: ["0px 0px 0px rgba(0,0,0,0)", "0px 0px 20px rgba(0,0,0,0.1)", "0px 0px 0px rgba(0,0,0,0)"]
-                            } : {}}
-                            transition={{ repeat: Infinity, duration: 2 }}
-                            onClick={handlePlaybackToggle}
-                            className="w-14 h-14 bg-black rounded-full flex items-center justify-center text-white shadow-xl shadow-black/20 transition-transform active:scale-95"
-                          >
-                            {isSpeaking ? <Pause size={28} fill="currentColor" /> : <Play size={28} fill="currentColor" className="ml-1" />}
-                          </motion.button>
+
+                          <div className="flex items-center gap-3 sm:gap-6">
+                            <button 
+                              onClick={skipBackward}
+                              disabled={currentSentenceIndex <= 0}
+                              className="text-black/30 hover:text-black transition-all disabled:opacity-5 hover:scale-110 active:scale-90 shrink-0"
+                            >
+                              <SkipBack size={22} fill="currentColor" />
+                            </button>
+                            
+                            <motion.button 
+                              whileHover={{ scale: 1.05 }}
+                              whileTap={{ scale: 0.95 }}
+                              animate={isSpeaking ? { 
+                                boxShadow: ["0px 0px 0px rgba(0,0,0,0)", "0px 0px 30px rgba(0,0,0,0.08)", "0px 0px 0px rgba(0,0,0,0)"]
+                              } : {}}
+                              transition={{ repeat: Infinity, duration: 2 }}
+                              onClick={handlePlaybackToggle}
+                              className="w-16 h-16 bg-black rounded-full flex items-center justify-center text-white shadow-2xl shadow-black/20 shrink-0 active:scale-95"
+                            >
+                              {isSpeaking ? <Pause size={28} fill="currentColor" /> : <Play size={28} fill="currentColor" className="ml-1" />}
+                            </motion.button>
+
+                            <button 
+                              onClick={skipForward}
+                              disabled={currentSentenceIndex >= getSentences(transcription).length - 1}
+                              className="text-black/30 hover:text-black transition-all disabled:opacity-5 hover:scale-110 active:scale-90 shrink-0"
+                            >
+                              <SkipForward size={22} fill="currentColor" />
+                            </button>
+                          </div>
 
                           <button 
-                            onClick={skipForward}
-                            disabled={currentSentenceIndex >= getSentences(transcription).length - 1}
-                            className="text-black/40 hover:text-black transition-all disabled:opacity-10 hover:scale-110 active:scale-90"
+                            onClick={() => mainSkip(15)}
+                            className="text-black/15 hover:text-black transition-all hover:scale-110 active:scale-95 shrink-0"
+                            title="Skip forward 15s"
                           >
-                            <SkipForward size={24} fill="currentColor" />
+                            <RotateCw size={18} />
                           </button>
                         </div>
                       </div>
@@ -1655,10 +1936,11 @@ export default function App() {
                     </div>
                   )}
                 </motion.div>
-              )}
-            </AnimatePresence>
-          </motion.div>
-        </section>
+              )
+            )}
+          </AnimatePresence>
+        </motion.div>
+      </section>
 
         {/* Configurations - Apple Settings Style Sidebar */}
         <aside className={`${activeTab === 'settings' ? 'flex' : 'hidden'} md:flex w-full md:w-80 md:bg-[#F2F2F7] flex-col overflow-y-auto custom-scrollbar relative z-[60] border-l border-black/[0.03]`}>
@@ -1986,11 +2268,11 @@ export default function App() {
         </aside>
 
         {/* History Tab for Mobile & Desktop */}
-        <aside className={`${activeTab === 'history' ? 'flex' : 'hidden'} w-full md:w-80 border-r border-black/10 p-10 pb-32 flex-col bg-white/20 overflow-y-auto`}>
+        <aside className={`${activeTab === 'history' ? 'flex' : 'hidden'} md:flex w-full md:w-80 border-r border-black/10 flex-col bg-white/20 overflow-y-auto custom-scrollbar relative z-[60]`}>
           <motion.div 
             initial={{ opacity: 0, scale: 0.98 }}
             animate={{ opacity: 1, scale: 1 }}
-            className="flex flex-col"
+            className="flex-1 p-10 pb-32 flex flex-col"
           >
            <div className="flex items-center justify-between mb-8">
              <h2 className="text-[10px] uppercase tracking-widest text-black/50 font-black italic">History</h2>
@@ -2095,10 +2377,11 @@ export default function App() {
       `}} />
 
       {/* Unified Floating Bottom Navigation (Apple Style) */}
-      <div className="fixed bottom-6 inset-x-0 flex justify-center z-50 px-6 pointer-events-none">
+      <div className="fixed bottom-6 inset-x-0 flex justify-center z-[100] px-6 pointer-events-none">
         <nav className="bg-white/80 backdrop-blur-2xl border border-black/[0.05] shadow-[0_12px_40px_rgba(0,0,0,0.12)] rounded-full p-1.5 flex items-center gap-1 pointer-events-auto">
           {[
             { id: 'live', label: 'Capture', icon: Mic },
+            { id: 'visual', label: 'Visual', icon: BookOpen },
             { id: 'history', label: 'Archive', icon: RotateCcw },
             { id: 'settings', label: 'Config', icon: Settings },
           ].map((btn) => (

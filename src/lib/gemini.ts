@@ -138,16 +138,23 @@ export async function textToSpeech(text: string, voiceName: string = 'Kore') {
   const ai = getAI();
   const modelName = "gemini-3.1-flash-tts-preview";
   
-  // Chunk text if it's too long (Gemini TTS likes small chunks for stability in preview)
-  const MAX_CHARS = 400; // Reduced from 800 for better reliability
+  // Chunk text if it's too long (Gemini TTS prefers small chunks for stability)
+  const MAX_CHARS = 300; // Further reduced for stability
   
-  // Split text into sentences or chunks carefully
+  // Clean text: strip special characters and normalize whitespace
+  const cleanText = text
+    .replace(/[*_#~`]/g, '') // Remove markdown
+    .replace(/[\n\r\t]/g, ' ') // Replace whitespace
+    .replace(/\s+/g, ' ') // Normalize spaces
+    .trim();
+
+  // Split text into chunks
   const chunks: string[] = [];
-  if (text.length <= MAX_CHARS) {
-    chunks.push(text);
+  if (cleanText.length <= MAX_CHARS) {
+    chunks.push(cleanText);
   } else {
-    // Split by punctuation first, then by space if needed
-    const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+    // Split by punctuation first
+    const sentences = cleanText.match(/[^.!?]+[.!?]+/g) || [cleanText];
     let currentChunk = "";
     
     for (const sentence of sentences) {
@@ -157,6 +164,21 @@ export async function textToSpeech(text: string, voiceName: string = 'Kore') {
       } else {
         currentChunk += sentence;
       }
+      
+      // If a single sentence is still too long, break it by words
+      if (currentChunk.length > MAX_CHARS) {
+        const words = currentChunk.split(' ');
+        let tempChunk = "";
+        for (const word of words) {
+          if ((tempChunk + " " + word).length > MAX_CHARS) {
+            chunks.push(tempChunk.trim());
+            tempChunk = word;
+          } else {
+            tempChunk += (tempChunk ? " " : "") + word;
+          }
+        }
+        currentChunk = tempChunk;
+      }
     }
     if (currentChunk.trim()) chunks.push(currentChunk.trim());
   }
@@ -165,27 +187,42 @@ export async function textToSpeech(text: string, voiceName: string = 'Kore') {
     const audioResults: string[] = [];
     
     for (const chunk of chunks) {
-      // Add a tiny delay between chunks if multiple
-      if (chunks.indexOf(chunk) > 0) {
-        await new Promise(resolve => setTimeout(resolve, 150));
-      }
+      let retryCount = 0;
+      const MAX_RETRIES = 2;
+      let chunkSuccess = false;
 
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: [{ parts: [{ text: `${chunk}` }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName },
+      while (retryCount <= MAX_RETRIES && !chunkSuccess) {
+        try {
+          if (chunks.indexOf(chunk) > 0 || retryCount > 0) {
+            // Increased delay for stability
+            await new Promise(resolve => setTimeout(resolve, 250 + (retryCount * 500)));
+          }
+
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: [{ parts: [{ text: chunk }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName },
+                },
+              },
             },
-          },
-        },
-      });
+          });
 
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) {
-        audioResults.push(base64Audio);
+          const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          if (base64Audio) {
+            audioResults.push(base64Audio);
+            chunkSuccess = true;
+          } else {
+            throw new Error("No audio data returned in candidate");
+          }
+        } catch (chunkErr: any) {
+          console.warn(`TTS Chunk Retry ${retryCount}/${MAX_RETRIES}:`, chunkErr);
+          retryCount++;
+          if (retryCount > MAX_RETRIES) throw chunkErr;
+        }
       }
     }
 
