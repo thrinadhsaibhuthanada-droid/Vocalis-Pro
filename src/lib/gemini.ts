@@ -1,6 +1,21 @@
 import { GoogleGenAI } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+let aiInstance: GoogleGenAI | null = null;
+
+function getAI() {
+  if (!aiInstance) {
+    // Note: AI Studio replaces process.env.GEMINI_API_KEY at build time via the define block.
+    // For external deployments (e.g. Vercel), it may fall back to standard process.env if available,
+    // although Vite typically requires VITE_ prefix or define replacement.
+    const apiKey = process.env.GEMINI_API_KEY;
+    
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY is not defined. Please ensure your API key is correctly configured in your environment variables.");
+    }
+    aiInstance = new GoogleGenAI({ apiKey });
+  }
+  return aiInstance;
+}
 
 export interface TranscriptionOptions {
   mappings?: string;
@@ -20,8 +35,6 @@ export interface TranscriptionOptions {
 }
 
 export async function transcribeAudio(base64Audio: string, mimeType: string, options: TranscriptionOptions = {}) {
-  const model = "gemini-3-flash-preview";
-
   const systemInstruction = `
 You are a professional scribe and linguistic editor. Your goal is to transform SPOKEN audio into polished, high-quality WRITTEN text.
 
@@ -70,6 +83,9 @@ You are a professional scribe and linguistic editor. Your goal is to transform S
 - DO NOT wrap the output in markdown code blocks unless the transcription itself is code.
 `;
 
+  const modelName = "gemini-3-flash-preview";
+  const ai = getAI();
+
   let promptPrefix = "";
   if (options.mappings) {
     promptPrefix += `MAPPINGS block:\n${options.mappings}\n\n`;
@@ -94,7 +110,7 @@ You are a professional scribe and linguistic editor. Your goal is to transform S
   }
 
   const response = await ai.models.generateContent({
-    model,
+    model: modelName,
     contents: [
       {
         parts: [
