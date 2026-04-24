@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Mic, 
@@ -16,8 +16,10 @@ import {
   Play,
   Pause,
   RotateCcw,
+  RotateCw,
   Settings,
   ChevronRight,
+  ChevronDown,
   Share2,
   Download,
   SkipForward,
@@ -32,9 +34,55 @@ import {
 } from 'lucide-react';
 import { toPng } from 'html-to-image';
 import { useAudioRecorder, blobToBase64 } from '@/src/lib/audioRecorder';
-import { transcribeAudio, TranscriptionOptions } from '@/src/lib/gemini';
+import { transcribeAudio, textToSpeech, TranscriptionOptions } from '@/src/lib/gemini';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+
+// Helper to strip markdown for TTS
+const stripMarkdown = (text: string) => {
+  return text
+    .replace(/[*_~`]/g, '')
+    .replace(/#+\s/g, '')
+    .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1')
+    .replace(/\n+/g, ' ')
+    .trim();
+};
+
+// Helper to convert base64 PCM to WAV Blob
+const pcmToWavBlob = (base64Pcm: string, sampleRate: number = 24000) => {
+  const binaryString = atob(base64Pcm);
+  const len = binaryString.length;
+  const buffer = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    buffer[i] = binaryString.charCodeAt(i);
+  }
+
+  // Add WAV header (44 bytes)
+  const wavHeader = new ArrayBuffer(44);
+  const view = new DataView(wavHeader);
+  
+  const writeString = (offset: number, string: string) => {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  };
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + len, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, len, true);
+
+  return new Blob([wavHeader, buffer], { type: 'audio/wav' });
+};
 
 function VocalisLogo({ className = "w-8 h-8" }: { className?: string }) {
   return (
@@ -143,6 +191,335 @@ function Waveform({
   );
 }
 
+interface ArchiveItem {
+  id: string;
+  text: string;
+  timestamp: number;
+  recordedAudioBlob?: Blob | null;
+  generatedAudioBlob?: Blob | null;
+  title: string;
+}
+
+function ImmersivePlayer({ item, onClose, options, setTranscriptionHistory, setSelectedArchiveItem }: { 
+  item: ArchiveItem, 
+  onClose: () => void, 
+  options: TranscriptionOptions,
+  setTranscriptionHistory: React.Dispatch<React.SetStateAction<ArchiveItem[]>>,
+  setSelectedArchiveItem: React.Dispatch<React.SetStateAction<ArchiveItem | null>>
+}) {
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [generatedUrl, setGeneratedUrl] = useState<string | null>(null);
+  const [playbackRate, setPlaybackRate] = useState(options.ttsRate || 1);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const [errorStatus, setErrorStatus] = useState<string | null>(null);
+
+  const prepareAudio = async () => {
+    // ... logic remains in useEffect but we can extract it or call it here for retry
+  };
+
+  const togglePlay = () => {
+    if (audioRef.current && generatedUrl) {
+      if (isPlaying) audioRef.current.pause();
+      else audioRef.current.play();
+    } else if (!isGenerating) {
+      // Logic to trigger re-run of effect or just manual call
+      // We'll use a petty state to force re-run if needed
+      setRetryCount(prev => prev + 1);
+    }
+  };
+
+  const [retryCount, setRetryCount] = useState(0);
+
+  // Use natural high-quality TTS for the immersive player
+  useEffect(() => {
+    let currentUrl: string | null = null;
+    let isMounted = true;
+
+    const runPrepare = async () => {
+      setGeneratedUrl(null);
+      setErrorStatus(null);
+      
+      if (item.generatedAudioBlob) {
+        if (!isMounted) return;
+        currentUrl = URL.createObjectURL(item.generatedAudioBlob);
+        setGeneratedUrl(currentUrl);
+        return;
+      } 
+      
+      setIsGenerating(true);
+      try {
+        const base64Pcm = await textToSpeech(stripMarkdown(item.text), options.ttsVoice || 'Kore');
+        if (base64Pcm && isMounted) {
+          const wavBlob = pcmToWavBlob(base64Pcm);
+          currentUrl = URL.createObjectURL(wavBlob);
+          setGeneratedUrl(currentUrl);
+          setTranscriptionHistory(prev => prev.map(i => 
+            i.id === item.id ? { ...i, generatedAudioBlob: wavBlob } : i
+          ));
+          setSelectedArchiveItem(prev => {
+            if (prev?.id === item.id) return { ...prev, generatedAudioBlob: wavBlob };
+            return prev;
+          });
+        } else if (isMounted) {
+          setErrorStatus('Neural engine took too long. Tap to retry.');
+        }
+      } catch (err) {
+        console.error("Player Neural TTS generation failed:", err);
+        if (isMounted) setErrorStatus('Neural generation failed. Check connection.');
+      } finally {
+        if (isMounted) setIsGenerating(false);
+      }
+    };
+
+    runPrepare();
+    return () => {
+      isMounted = false;
+      if (currentUrl) URL.revokeObjectURL(currentUrl);
+    };
+  }, [item.id, item.generatedAudioBlob, options.ttsVoice, retryCount]);
+
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.playbackRate = playbackRate;
+    }
+  }, [playbackRate]);
+
+  const skip = (seconds: number) => {
+    if (audioRef.current) {
+      audioRef.current.currentTime = Math.max(0, Math.min(audioRef.current.duration, audioRef.current.currentTime + seconds));
+    }
+  };
+
+  const downloadItemAudio = () => {
+    if (!item.generatedAudioBlob) return;
+    const url = URL.createObjectURL(item.generatedAudioBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `neural-${item.title.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}.wav`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <motion.div 
+      initial={{ y: "100%" }}
+      animate={{ y: 0 }}
+      exit={{ y: "100%" }}
+      transition={{ type: "spring", damping: 30, stiffness: 200 }}
+      className="fixed inset-0 z-[200] bg-[#F9F7F2] flex flex-col md:flex-row overflow-hidden shadow-2xl"
+    >
+      {/* Background Orbs */}
+      <div className="absolute inset-0 z-0 opacity-10 pointer-events-none overflow-hidden">
+        <motion.div 
+          animate={{ scale: [1, 1.2, 1], rotate: [0, 90, 0] }}
+          transition={{ repeat: Infinity, duration: 20 }}
+          className="absolute -top-1/4 -left-1/4 w-[800px] h-[800px] bg-black/10 rounded-full blur-3xl" 
+        />
+        <motion.div 
+          animate={{ scale: [1.2, 1, 1.2], rotate: [90, 0, 90] }}
+          transition={{ repeat: Infinity, duration: 25 }}
+          className="absolute -bottom-1/4 -right-1/4 w-[800px] h-[800px] bg-black/5 rounded-full blur-3xl" 
+        />
+      </div>
+
+      <audio 
+        ref={audioRef} 
+        src={generatedUrl || undefined}
+        onTimeUpdate={() => audioRef.current && setCurrentTime(audioRef.current.currentTime)}
+        onLoadedMetadata={() => audioRef.current && setDuration(audioRef.current.duration)}
+        onEnded={() => setIsPlaying(false)}
+        onPlay={() => setIsPlaying(true)}
+        onPause={() => setIsPlaying(false)}
+      />
+
+      {/* Header */}
+      <header className="absolute top-0 left-0 right-0 p-6 md:p-10 flex items-center justify-between z-[210] pointer-events-none">
+        <motion.button 
+          whileHover={{ scale: 1.1, backgroundColor: 'rgba(0,0,0,0.1)' }}
+          whileTap={{ scale: 0.9 }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onClose();
+          }} 
+          className="w-12 h-12 flex items-center justify-center bg-black/5 rounded-full backdrop-blur-md transition-all pointer-events-auto shadow-sm"
+        >
+          <ChevronDown className="text-black/60" size={24} />
+        </motion.button>
+        <div className="flex flex-col items-center">
+          <span className="text-[10px] uppercase font-black tracking-[0.3em] text-black/30 mb-0.5">Neural Playback</span>
+          <span className="text-xs font-serif italic text-black/50 truncate max-w-[150px] md:max-w-[400px]">{item.title}</span>
+        </div>
+        <button 
+          onClick={() => {
+            const rates = [1, 1.25, 1.5, 2, 0.75];
+            const nextIdx = (rates.indexOf(playbackRate) + 1) % rates.length;
+            setPlaybackRate(rates[nextIdx]);
+          }}
+          className="w-12 h-12 flex items-center justify-center bg-black/5 rounded-full text-[10px] font-black pointer-events-auto backdrop-blur-md hover:bg-black/10 transition-all shadow-sm"
+        >
+          {playbackRate}x
+        </button>
+      </header>
+
+      {/* Main Container for scroll on mobile */}
+      <div className="flex-1 flex flex-col md:flex-row h-full overflow-y-auto md:overflow-hidden relative z-10">
+        {/* Visualizer & Controls */}
+        <div className="w-full md:flex-1 flex flex-col items-center justify-center p-6 pt-32 md:p-12 md:pt-12 min-h-screen md:min-h-0 bg-transparent">
+          <motion.div 
+            layoutId={`card-${item.id}`}
+            className="w-full max-w-[420px] aspect-square bg-white shadow-[0_40px_100px_-20px_rgba(0,0,0,0.1)] rounded-[48px] border border-black/5 p-10 md:p-14 flex flex-col justify-between overflow-hidden relative"
+          >
+            <div className="flex justify-between items-start">
+              <VocalisLogo className="w-14 h-14 text-black" />
+              <div className="flex gap-1">
+                 {[1, 2, 3].map(i => (
+                   <motion.div 
+                     key={i}
+                     animate={isPlaying ? { height: [4, 12, 4] } : { height: 4 }}
+                     transition={{ repeat: Infinity, duration: 0.6, delay: i * 0.1 }}
+                     className="w-1 bg-black/20 rounded-full"
+                   />
+                 ))}
+              </div>
+            </div>
+            
+            <div className="space-y-6">
+               <div className="w-12 h-1 bg-black/10 rounded-full" />
+               <h3 className="text-2xl md:text-4xl font-serif leading-[1.1] text-black italic tracking-tight">{item.title}</h3>
+            </div>
+            
+            <div className="flex justify-between items-end border-t border-black/5 pt-8">
+              <div>
+                <p className="text-[9px] uppercase font-black tracking-widest text-black/30 mb-1.5">Archived Output</p>
+                <p className="text-base font-serif italic text-black/60">
+                  {new Date(item.timestamp).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' })}
+                </p>
+              </div>
+              <div className="text-right">
+                 <p className="text-[8px] font-black text-black/20 tracking-tighter">VOCALIS_ENGINE</p>
+                 <p className="text-[8px] font-black text-black/20">FRAGMENT_{item.id.slice(0, 4).toUpperCase()}</p>
+              </div>
+            </div>
+          </motion.div>
+
+          {/* Controls underneath the card */}
+          <div className="w-full max-w-[420px] mt-12 md:mt-16 space-y-10 px-4">
+            <div className="space-y-4">
+              {errorStatus && (
+                <div className="text-center pb-2">
+                  <p className="text-[10px] uppercase font-black tracking-widest text-red-500/80 italic">{errorStatus}</p>
+                </div>
+              )}
+              <div 
+                className="relative w-full h-[6px] bg-black/5 rounded-full cursor-pointer group/progress"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const x = e.clientX - rect.left;
+                  const percent = x / rect.width;
+                  if (audioRef.current) audioRef.current.currentTime = percent * duration;
+                }}
+              >
+                 <motion.div 
+                   className="absolute left-0 top-0 h-full bg-black rounded-full"
+                   style={{ width: duration ? `${(currentTime / duration) * 100}%` : '0%' }}
+                 />
+              </div>
+              <div className="flex justify-between text-[11px] font-black tracking-widest text-black/40 tabular-nums">
+                <span>{Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')}</span>
+                <span className="opacity-40">{Math.floor(duration / 60)}:{Math.floor(duration % 60).toString().padStart(2, '0')}</span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between px-4">
+              <button onClick={() => skip(-15)} className="text-black/30 hover:text-black transition-colors active:scale-90"><RotateCcw size={32} /></button>
+              <div className="flex items-center gap-12">
+                <button onClick={() => skip(-10)} className="text-black/30 hover:text-black transition-colors active:scale-90"><SkipBack size={36} fill="currentColor" /></button>
+                <motion.button 
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={togglePlay}
+                  disabled={isGenerating}
+                  className={`w-24 h-24 bg-black text-white rounded-full flex items-center justify-center shadow-2xl active:scale-95 transition-all ${isGenerating ? 'opacity-50' : 'hover:shadow-black/20'}`}
+                >
+                  {isGenerating ? (
+                    <RefreshCcw className="animate-spin text-white/50" size={36} />
+                  ) : isPlaying ? (
+                    <Pause size={40} fill="currentColor" />
+                  ) : (
+                    <Play size={40} fill="currentColor" className="ml-2" />
+                  )}
+                </motion.button>
+                <button onClick={() => skip(10)} className="text-black/30 hover:text-black transition-colors active:scale-90"><SkipForward size={36} fill="currentColor" /></button>
+              </div>
+              <button onClick={() => skip(15)} className="text-black/30 hover:text-black transition-colors active:scale-90"><RotateCw size={32} /></button>
+            </div>
+          </div>
+        </div>
+
+        {/* Right Aspect: Immersive Text */}
+        <div className="w-full md:flex-1 bg-white/40 md:bg-black/[0.01] p-8 md:p-20 flex flex-col justify-start md:justify-center overflow-y-auto md:overflow-y-auto custom-scrollbar backdrop-blur-3xl md:backdrop-blur-none border-t md:border-t-0 md:border-l border-black/5">
+          <div className="max-w-[600px] mx-auto w-full space-y-12 md:space-y-16 py-12 md:py-0">
+            <div className="space-y-8">
+              <div className="flex items-center gap-3">
+                <div className="w-3 h-3 rounded-full bg-black/10 animate-pulse" />
+                <p className="text-[11px] uppercase font-black tracking-[0.3em] text-black/30 italic">Transcript Fragment</p>
+              </div>
+              <div className="markdown-body font-serif italic text-black/80 leading-[1.6] md:leading-[1.5] text-2xl md:text-4xl selection:bg-black selection:text-white transition-opacity duration-1000">
+                <ReactMarkdown 
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    h1: ({node, ...props}) => <h1 className="text-3xl md:text-5xl font-medium text-black mb-8 mt-12 first:mt-0 leading-tight" {...props} />,
+                    h2: ({node, ...props}) => <h2 className="text-2xl md:text-4xl font-medium text-black mb-6 mt-10" {...props} />,
+                    h3: ({node, ...props}) => <h3 className="text-xl md:text-3xl font-bold text-black mb-4 mt-8" {...props} />,
+                    p: ({node, ...props}) => <p className="mb-6 last:mb-0" {...props} />,
+                    ul: ({node, ...props}) => <ul className="list-disc pl-8 mb-6 space-y-2" {...props} />,
+                    ol: ({node, ...props}) => <ol className="list-decimal pl-8 mb-6 space-y-2" {...props} />,
+                    li: ({node, ...props}) => <li className="pl-2" {...props} />,
+                    strong: ({node, ...props}) => <strong className="font-black text-black not-italic" {...props} />,
+                  }}
+                >
+                  {item.text}
+                </ReactMarkdown>
+              </div>
+            </div>
+            
+            <div className="pt-12 border-t-2 border-black/5 flex flex-col gap-6">
+              <div className="grid grid-cols-2 gap-4">
+                <motion.button 
+                  whileHover={{ scale: 1.02, backgroundColor: 'white' }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={() => {
+                    navigator.clipboard.writeText(item.text);
+                  }}
+                  className="flex items-center justify-center gap-3 py-6 bg-white/50 border border-black/5 rounded-3xl text-[11px] uppercase font-black tracking-widest shadow-sm transition-all font-sans"
+                >
+                  <Copy size={16} /> Copy fragment
+                </motion.button>
+                <motion.button 
+                  whileHover={{ scale: 1.02, backgroundColor: 'white' }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={downloadItemAudio}
+                  disabled={!item.generatedAudioBlob}
+                  className={`flex items-center justify-center gap-3 py-6 bg-white/50 border border-black/5 rounded-3xl text-[11px] uppercase font-black tracking-widest shadow-sm transition-all font-sans ${!item.generatedAudioBlob ? 'opacity-30' : ''}`}
+                >
+                  <Download size={16} /> {item.generatedAudioBlob ? 'Download Neural' : 'Generating...'}
+                </motion.button>
+              </div>
+              <p className="text-[10px] text-center text-black/20 font-black uppercase tracking-[0.4em] italic">End of Captured Session</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
 export default function App() {
   const { 
     isRecording, 
@@ -157,7 +534,9 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [transcription, setTranscription] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
-  const [transcriptionHistory, setTranscriptionHistory] = useState<string[]>([]);
+  const [transcriptionHistory, setTranscriptionHistory] = useState<ArchiveItem[]>([]);
+  const [selectedArchiveItem, setSelectedArchiveItem] = useState<ArchiveItem | null>(null);
+  const [isPlayerOpen, setIsPlayerOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [archived, setArchived] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -165,6 +544,7 @@ export default function App() {
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
+  const [isGeneratingAudio, setIsGeneratingAudio] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const visualCardRef = useRef<HTMLDivElement>(null);
   
@@ -224,7 +604,9 @@ export default function App() {
               'google \u0939\u093f\u0928\u094d\u0926\u0940', // Google Hindi
               'google \u0c24\u0c46\u0c32\u0c41\u0c17\u0c41', // Google Telugu
               'microsoft \u0939\u093f\u0928\u094d\u0926\u0940',
-              'microsoft \u0c24\u0c46\u0c32\u0c41\u0c17\u0c41'
+              'microsoft \u0c24\u0c46\u0c32\u0c41\u0c17\u0c41',
+              'telugu',
+              'hindi'
             ];
             
             if (preferredNames.some(p => name.includes(p))) score += 50;
@@ -291,8 +673,30 @@ export default function App() {
 
   const getSentences = (text: string) => {
     if (!text) return [];
-    // Split by common delimiters and filter small crumbs
-    return text.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 1);
+    // Deeply strip markdown and normalize structure for better TTS flow
+    const cleanText = text
+      .replace(/!\[.*?\]\(.*?\)/g, '') // Remove images
+      .replace(/\[(.*?)\]\(.*?\)/g, '$1') // Keep link text
+      .replace(/[*_~`]/g, '') // Remove all style markers
+      .replace(/#+\s/g, '') // Remove headers
+      .replace(/\n\s*[-*+]\s/g, '. ') // Bullets to sentence markers
+      .replace(/\n\s*\d+\.\s/g, '. ') // Numbers to sentence markers
+      .replace(/\n+/g, '. '); // Line breaks to markers
+    
+    // Split by punctuation and filter empty fragments
+    return cleanText.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 1);
+  };
+
+  const stripMarkdown = (text: string) => {
+    return text
+      .replace(/[*_~`]/g, '') // Remove markers
+      .replace(/#+\s/g, '')   // Remove headers
+      .replace(/!\[.*?\]\(.*?\)/g, '') // Remove images
+      .replace(/\[(.*?)\]\(.*?\)/g, '$1') // Remove links
+      .replace(/\n\s*[-*+]\s/g, '\n') // Remove list bullets
+      .replace(/\n\s*\d+\.\s/g, '\n') // Remove numbered lists
+      .replace(/\s+/g, ' ') // Normalize whitespace
+      .trim();
   };
 
   const playSentence = (index: number) => {
@@ -306,6 +710,7 @@ export default function App() {
     }
 
     setCurrentSentenceIndex(index);
+    // Sentences are already cleaned in getSentences
     const utterance = new SpeechSynthesisUtterance(sentences[index]);
     
     let targetVoice = voices.find(v => v.name === options.ttsVoice);
@@ -347,17 +752,52 @@ export default function App() {
     setCurrentSentenceIndex(-1);
   };
 
+  const playNeuralSpeech = async () => {
+    if (!transcription) return;
+    
+    // Check if the current last archive item matches this transcription and has a blob
+    const existingItem = transcriptionHistory.find(i => i.text === transcription);
+    
+    if (existingItem?.generatedAudioBlob) {
+      const url = URL.createObjectURL(existingItem.generatedAudioBlob);
+      const audio = new Audio(url);
+      audio.onended = () => {
+        setIsSpeaking(false);
+        URL.revokeObjectURL(url);
+      };
+      setIsSpeaking(true);
+      audio.play();
+      return;
+    }
+
+    // Otherwise generate on the fly
+    setIsSpeaking(true);
+    try {
+      const base64Pcm = await textToSpeech(stripMarkdown(transcription), options.ttsVoice || 'Kore');
+      if (base64Pcm) {
+        const wavBlob = pcmToWavBlob(base64Pcm);
+        const url = URL.createObjectURL(wavBlob);
+        const audio = new Audio(url);
+        audio.onended = () => {
+          setIsSpeaking(false);
+          URL.revokeObjectURL(url);
+        };
+        audio.play();
+      }
+    } catch (err: any) {
+      console.error("Neural playback failed:", err);
+      setError(`Neural playback unavailable: ${err.message || 'Server error'}`);
+      setTimeout(() => setError(null), 5000);
+      setIsSpeaking(false);
+    }
+  };
+
   const handlePlaybackToggle = () => {
     if (isSpeaking) {
-      window.speechSynthesis.pause();
       setIsSpeaking(false);
+      window.speechSynthesis.cancel();
     } else {
-      if (window.speechSynthesis.paused) {
-        window.speechSynthesis.resume();
-        setIsSpeaking(true);
-      } else {
-        playSentence(currentSentenceIndex === -1 ? 0 : currentSentenceIndex);
-      }
+      playNeuralSpeech();
     }
   };
 
@@ -390,12 +830,13 @@ export default function App() {
     setIsProcessing(true);
     setError(null);
     try {
+      const audioType = audioBlob.type || 'audio/webm';
       if (audioBlob.size < 1000) {
         throw new Error('Audio fragment too short. Please record for a few seconds.');
       }
 
       const base64 = await blobToBase64(audioBlob);
-      const result = await transcribeAudio(base64, audioBlob.type, options);
+      const result = await transcribeAudio(base64, audioType, options);
       
       if (!result) {
         throw new Error('No transcription generated. The model returned an empty result.');
@@ -403,10 +844,25 @@ export default function App() {
 
       const cleanedText = result;
       
-      if (transcription) {
-        setTranscriptionHistory(prev => [transcription, ...prev].slice(0, 5));
+      // Auto-archive with metadata
+      const newArchiveItem: ArchiveItem = {
+        id: crypto.randomUUID(),
+        text: cleanedText,
+        timestamp: Date.now(),
+        recordedAudioBlob: audioBlob,
+        title: cleanedText.split('\n')[0].slice(0, 40).replace(/[#*]/g, '') || 'Neural Capture'
+      };
+
+      setTranscriptionHistory(prev => [newArchiveItem, ...prev].slice(0, 50));
+      
+      // Pre-generate high quality TTS in background for the archive
+      if (options.enableTTS) {
+        generateAndStoreAudio(newArchiveItem);
       }
+      
       setTranscription(cleanedText);
+      setArchived(true); // Temporary feedback
+      setTimeout(() => setArchived(false), 2000);
 
       if (options.enableTTS) {
         playSentence(0);
@@ -436,7 +892,7 @@ export default function App() {
     if (transcriptionHistory.length === 0) return;
     const previous = transcriptionHistory[0];
     setTranscriptionHistory(prev => prev.slice(1));
-    setTranscription(previous);
+    setTranscription(previous.text);
   };
 
   const copyToClipboard = async () => {
@@ -478,12 +934,47 @@ export default function App() {
 
   const saveToArchive = () => {
     if (!transcription) return;
+    
+    const newArchiveItem: ArchiveItem = {
+      id: crypto.randomUUID(),
+      text: transcription,
+      timestamp: Date.now(),
+      recordedAudioBlob: audioBlob,
+      title: transcription.split('\n')[0].slice(0, 40).replace(/[#*]/g, '') || 'Manual Archive'
+    };
+
     setTranscriptionHistory(prev => {
-      if (prev.includes(transcription)) return prev;
-      return [transcription, ...prev].slice(0, 10);
+      if (prev.some(item => item.text === transcription)) return prev;
+      return [newArchiveItem, ...prev].slice(0, 50);
     });
+
+    // Pre-generate audio for manually saved items too
+    generateAndStoreAudio(newArchiveItem);
+
     setArchived(true);
     setTimeout(() => setArchived(false), 2000);
+  };
+
+  const generateAndStoreAudio = async (item: ArchiveItem) => {
+    try {
+      const cleanText = stripMarkdown(item.text);
+      // Use the selected voice or Kore as premium default
+      const base64Pcm = await textToSpeech(cleanText, options.ttsVoice || 'Kore');
+      if (base64Pcm) {
+        const wavBlob = pcmToWavBlob(base64Pcm);
+        setTranscriptionHistory(prev => prev.map(i => 
+          i.id === item.id ? { ...i, generatedAudioBlob: wavBlob } : i
+        ));
+        
+        // Update selected item too so the player catches the change
+        setSelectedArchiveItem(prev => {
+          if (prev?.id === item.id) return { ...prev, generatedAudioBlob: wavBlob };
+          return prev;
+        });
+      }
+    } catch (err) {
+      console.error("Background TTS generation failed:", err);
+    }
   };
 
   const handleShare = async () => {
@@ -523,6 +1014,70 @@ export default function App() {
     }
   };
 
+  const handleDownloadImage = async () => {
+    if (!visualCardRef.current || !transcription) return;
+    
+    setIsSharing(true);
+    try {
+      await new Promise(r => setTimeout(r, 100));
+      const dataUrl = await toPng(visualCardRef.current, {
+        quality: 1.0,
+        backgroundColor: '#F9F7F2',
+      });
+      
+      const link = document.createElement('a');
+      link.download = `vocalis-${Date.now()}.png`;
+      link.href = dataUrl;
+      link.click();
+    } catch (err) {
+      console.error('Download failed:', err);
+      setError('Failed to generate image for download.');
+    } finally {
+      setIsSharing(false);
+    }
+  };
+
+  const downloadGeneratedAudio = async () => {
+    if (!transcription) return;
+    
+    setIsGeneratingAudio(true);
+    try {
+      const cleanText = stripMarkdown(transcription);
+      // For now we use 'Kore' as a default high-quality voice, 
+      // but Gemini 3.1 TTS might support more in the future.
+      const base64Pcm = await textToSpeech(cleanText, 'Kore');
+      if (base64Pcm) {
+        const wavBlob = pcmToWavBlob(base64Pcm);
+        const url = URL.createObjectURL(wavBlob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `vocalis-generated-${Date.now()}.wav`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      console.error('Audio generation failed:', err);
+      setError('Failed to generate audio for download.');
+    } finally {
+      setIsGeneratingAudio(false);
+    }
+  };
+
+  const downloadAudio = () => {
+    // This is for the ORIGINAL recorded audio
+    if (!audioBlob) return;
+    const url = URL.createObjectURL(audioBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `vocalis-recording-${Date.now()}.wav`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   const clearHistory = () => {
     if (confirm('Clear all session history?')) {
       setTranscriptionHistory([]);
@@ -550,11 +1105,23 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex-1 space-y-8">
+          <div className="flex-1">
             <div 
-              className={`${options.fontFamily === 'sans' ? 'font-sans' : options.fontFamily === 'mono' ? 'font-mono' : 'font-serif'} text-black prose prose-headings:font-medium prose-p:leading-relaxed`}
+              className={`${options.fontFamily === 'sans' ? 'font-sans' : options.fontFamily === 'mono' ? 'font-mono' : 'font-serif'} text-black markdown-capture-container`}
               style={{ fontSize: `${options.fontSize}px` }}
             >
+              <style dangerouslySetInnerHTML={{ __html: `
+                .markdown-capture-container ul { list-style-type: disc !important; padding-left: 1.5em !important; margin-bottom: 1em !important; }
+                .markdown-capture-container ol { list-style-type: decimal !important; padding-left: 1.5em !important; margin-bottom: 1em !important; }
+                .markdown-capture-container li { display: list-item !important; margin-bottom: 0.5em !important; }
+                .markdown-capture-container p { margin-bottom: 1.25em !important; line-height: 1.6 !important; }
+                .markdown-capture-container h1, .markdown-capture-container h2, .markdown-capture-container h3 { 
+                  font-weight: 600 !important; 
+                  margin-top: 1.5em !important; 
+                  margin-bottom: 0.75em !important; 
+                  line-height: 1.2 !important;
+                }
+              `}} />
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {transcription}
               </ReactMarkdown>
@@ -780,11 +1347,33 @@ export default function App() {
                       <motion.button 
                         whileHover={{ scale: 1.01 }}
                         whileTap={{ scale: 0.98 }}
+                        onClick={handleDownloadImage}
+                        disabled={isSharing}
+                        className={`flex-1 px-4 py-5 border text-[11px] uppercase font-black tracking-widest flex items-center justify-center gap-2 transition-all rounded-xl md:rounded-sm border-black text-black hover:bg-black/5 hover:scale-[1.01] ${isSharing ? 'opacity-50' : ''}`}
+                      >
+                        {isSharing ? <RefreshCcw size={18} className="animate-spin" /> : <Download size={18} />}
+                        {isSharing ? 'Generating...' : 'Download Image'}
+                      </motion.button>
+
+                      <motion.button 
+                        whileHover={{ scale: 1.01 }}
+                        whileTap={{ scale: 0.98 }}
                         onClick={saveToArchive}
                         className={`flex-1 px-4 py-5 border text-[11px] uppercase font-black tracking-widest flex items-center justify-center gap-2 transition-all rounded-xl md:rounded-sm ${archived ? 'bg-green-500 border-green-500 text-white' : 'border-black text-black hover:bg-black/5 hover:scale-[1.01]'}`}
                       >
                         {archived ? <Check size={18} /> : <History size={18} />}
                         {archived ? 'Saved' : 'Archive'}
+                      </motion.button>
+
+                      <motion.button 
+                        whileHover={{ scale: 1.01 }}
+                        whileTap={{ scale: 0.98 }}
+                        onClick={downloadGeneratedAudio}
+                        disabled={isGeneratingAudio}
+                        className={`flex-1 px-4 py-5 border border-black/10 text-[11px] uppercase font-black tracking-widest flex items-center justify-center gap-2 hover:border-black transition-all rounded-xl md:rounded-sm hover:bg-black/5 ${isGeneratingAudio ? 'opacity-50' : ''}`}
+                      >
+                        {isGeneratingAudio ? <RefreshCcw size={18} className="animate-spin" /> : <Volume2 size={18} />}
+                        {isGeneratingAudio ? 'Generating...' : 'Download Audio'}
                       </motion.button>
 
                       <motion.button 
@@ -1396,8 +1985,8 @@ export default function App() {
           </motion.div>
         </aside>
 
-        {/* History Tab for Mobile */}
-        <aside className={`${activeTab === 'history' ? 'flex' : 'hidden'} md:hidden w-full p-8 flex-col bg-white/20 overflow-y-auto`}>
+        {/* History Tab for Mobile & Desktop */}
+        <aside className={`${activeTab === 'history' ? 'flex' : 'hidden'} w-full md:w-80 border-r border-black/10 p-10 pb-32 flex-col bg-white/20 overflow-y-auto`}>
           <motion.div 
             initial={{ opacity: 0, scale: 0.98 }}
             animate={{ opacity: 1, scale: 1 }}
@@ -1415,24 +2004,34 @@ export default function App() {
              )}
            </div>
            {transcriptionHistory.length > 0 ? (
-             <div className="space-y-4">
-               {transcriptionHistory.map((text, i) => (
+             <div className="grid grid-cols-1 gap-4">
+               {transcriptionHistory.map((item, i) => (
                  <motion.div 
-                   key={i} 
+                   key={item.id} 
                    initial={{ opacity: 0, y: 10 }}
                    animate={{ opacity: 1, y: 0 }}
                    transition={{ delay: i * 0.05 }}
-                   className="p-5 bg-white border border-black/5 rounded-2xl shadow-sm"
+                   onClick={() => { 
+                     setSelectedArchiveItem(item); 
+                     setIsPlayerOpen(true); 
+                   }}
+                   className="group relative p-6 bg-white border border-black/10 rounded-3xl shadow-sm hover:shadow-xl hover:scale-[1.01] transition-all cursor-pointer overflow-hidden text-left"
                  >
-                    <p className="text-sm font-serif italic text-black/60 line-clamp-2 mb-3">"{text}"</p>
-                    <motion.button 
-                      whileHover={{ scale: 1.05 }}
-                      whileTap={{ scale: 0.95 }}
-                      onClick={() => { setTranscription(text); setActiveTab('live'); }}
-                      className="text-[9px] uppercase font-black tracking-widest text-black py-2 px-6 bg-black/5 rounded-full hover:bg-black hover:text-white transition-all shadow-sm"
-                    >
-                      Restore to Stage
-                    </motion.button>
+                   <div className="absolute top-0 left-0 w-1 h-full bg-black/10 group-hover:bg-black transition-colors" />
+                   <div className="flex justify-between items-start mb-3">
+                     <div className="flex flex-col">
+                       <span className="text-[9px] uppercase font-black tracking-widest text-black/40 mb-1">
+                         {new Date(item.timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+                       </span>
+                       <h3 className="text-base font-medium font-serif text-black leading-tight line-clamp-1 group-hover:text-black transition-colors">{item.title}</h3>
+                     </div>
+                     <div className="p-2.5 bg-black/5 rounded-full group-hover:bg-black group-hover:text-white transition-all">
+                       <Play size={12} fill="currentColor" />
+                     </div>
+                   </div>
+                   <p className="text-[11px] font-serif italic text-black/50 line-clamp-2 leading-relaxed">
+                     {item.text.replace(/[#*]/g, '').slice(0, 100)}...
+                   </p>
                  </motion.div>
                ))}
              </div>
@@ -1442,6 +2041,18 @@ export default function App() {
           </motion.div>
         </aside>
       </div>
+
+      <AnimatePresence>
+        {isPlayerOpen && selectedArchiveItem && (
+          <ImmersivePlayer 
+            item={selectedArchiveItem} 
+            onClose={() => setIsPlayerOpen(false)} 
+            options={options}
+            setTranscriptionHistory={setTranscriptionHistory}
+            setSelectedArchiveItem={setSelectedArchiveItem}
+          />
+        )}
+      </AnimatePresence>
 
       <style dangerouslySetInnerHTML={{ __html: `
         .custom-scrollbar::-webkit-scrollbar {
@@ -1484,7 +2095,7 @@ export default function App() {
       `}} />
 
       {/* Unified Floating Bottom Navigation (Apple Style) */}
-      <div className="fixed bottom-6 inset-x-0 flex justify-center z-[100] px-6 pointer-events-none">
+      <div className="fixed bottom-6 inset-x-0 flex justify-center z-50 px-6 pointer-events-none">
         <nav className="bg-white/80 backdrop-blur-2xl border border-black/[0.05] shadow-[0_12px_40px_rgba(0,0,0,0.12)] rounded-full p-1.5 flex items-center gap-1 pointer-events-auto">
           {[
             { id: 'live', label: 'Capture', icon: Mic },

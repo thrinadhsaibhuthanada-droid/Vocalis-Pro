@@ -1,12 +1,9 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Modality } from "@google/genai";
 
 let aiInstance: GoogleGenAI | null = null;
 
 function getAI() {
   if (!aiInstance) {
-    // Note: AI Studio replaces process.env.GEMINI_API_KEY at build time via the define block.
-    // For external deployments (e.g. Vercel), it may fall back to standard process.env if available,
-    // although Vite typically requires VITE_ prefix or define replacement.
     const apiKey = process.env.GEMINI_API_KEY;
     
     if (!apiKey) {
@@ -132,3 +129,102 @@ You are a professional scribe and linguistic editor. Your goal is to transform S
 
   return response.text;
 }
+
+/**
+ * Text to Speech using Gemini 3.1 Flash TTS model.
+ * Includes chunking for long text to avoid API timeouts/errors.
+ */
+export async function textToSpeech(text: string, voiceName: string = 'Kore') {
+  const ai = getAI();
+  const modelName = "gemini-3.1-flash-tts-preview";
+  
+  // Chunk text if it's too long (Gemini TTS likes small chunks for stability in preview)
+  const MAX_CHARS = 400; // Reduced from 800 for better reliability
+  
+  // Split text into sentences or chunks carefully
+  const chunks: string[] = [];
+  if (text.length <= MAX_CHARS) {
+    chunks.push(text);
+  } else {
+    // Split by punctuation first, then by space if needed
+    const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+    let currentChunk = "";
+    
+    for (const sentence of sentences) {
+      if ((currentChunk + sentence).length > MAX_CHARS && currentChunk.length > 0) {
+        chunks.push(currentChunk.trim());
+        currentChunk = sentence;
+      } else {
+        currentChunk += sentence;
+      }
+    }
+    if (currentChunk.trim()) chunks.push(currentChunk.trim());
+  }
+
+  try {
+    const audioResults: string[] = [];
+    
+    for (const chunk of chunks) {
+      // Add a tiny delay between chunks if multiple
+      if (chunks.indexOf(chunk) > 0) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
+
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: [{ parts: [{ text: `${chunk}` }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName },
+            },
+          },
+        },
+      });
+
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) {
+        audioResults.push(base64Audio);
+      }
+    }
+
+    if (audioResults.length === 0) return null;
+    if (audioResults.length === 1) return audioResults[0];
+
+    // Combine PCM chunks
+    // Since we are combining Base64 PCM, we need to decode them, join the bytes, then re-encode.
+    const combinedBytes = concatenateBase64Pcm(audioResults);
+    return combinedBytes;
+  } catch (err) {
+    console.error("Gemini TTS Error:", err);
+    throw err;
+  }
+}
+
+function concatenateBase64Pcm(base64Strings: string[]): string {
+  const byteArrays = base64Strings.map(b64 => {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  });
+
+  const totalLength = byteArrays.reduce((acc, curr) => acc + curr.length, 0);
+  const combined = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const array of byteArrays) {
+    combined.set(array, offset);
+    offset += array.length;
+  }
+
+  // Convert back to base64
+  let binary = "";
+  for (let i = 0; i < combined.length; i++) {
+    binary += String.fromCharCode(combined[i]);
+  }
+  return btoa(binary);
+}
+
