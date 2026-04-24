@@ -1,0 +1,6 @@
+{
+  "name": "Vocalis",
+  "description": "Neural Voice Capture & Transcription with Gemini Intelligence. A PWA-ready voice assistant for mobile and desktop.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}
